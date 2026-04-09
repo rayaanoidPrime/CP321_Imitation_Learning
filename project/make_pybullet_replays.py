@@ -23,6 +23,29 @@ OUT_DIR = Path(os.environ.get("OUT_DIR", ".")) / "pybullet_replays"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _capture_frame(sim: PandaSimEnv, mode: str = "default",
+                   width: int = 720, height: int = 540) -> np.ndarray:
+    if mode == "robomimic":
+        view = pb.computeViewMatrix(
+            cameraEyePosition=[1.45, -1.05, 1.18],
+            cameraTargetPosition=[0.15, 0.02, 0.58],
+            cameraUpVector=[0, 0, 1],
+            physicsClientId=sim._pcid,
+        )
+        proj = pb.computeProjectionMatrixFOV(
+            fov=52, aspect=width / height, nearVal=0.05, farVal=10.0,
+            physicsClientId=sim._pcid,
+        )
+        _, _, rgba, _, _ = pb.getCameraImage(
+            width=width, height=height,
+            viewMatrix=view, projectionMatrix=proj,
+            renderer=pb.ER_TINY_RENDERER,
+            physicsClientId=sim._pcid,
+        )
+        return np.array(rgba, dtype=np.uint8).reshape((height, width, 4))
+    return sim.capture_screenshot(width, height)
+
+
 def _annotate(frame: np.ndarray, title: str) -> Image.Image:
     img = Image.fromarray(frame[..., :3])
     draw = ImageDraw.Draw(img)
@@ -89,7 +112,7 @@ def _task_props(sim: PandaSimEnv, task_name: str, demo: dict) -> None:
 def _replay_segment(sim: PandaSimEnv, pos: np.ndarray, quat: np.ndarray,
                     title: str, frames: list[Image.Image],
                     update_scene=None, gripper_width: float | None = None,
-                    step_stride: int = 2) -> None:
+                    step_stride: int = 2, camera_mode: str = "default") -> None:
     q_cur = sim.get_joint_angles().copy()
     for i in range(len(pos)):
         T = make_pose(pos[i], quat_wxyz=quat[i])
@@ -102,10 +125,10 @@ def _replay_segment(sim: PandaSimEnv, pos: np.ndarray, quat: np.ndarray,
             T_ee, _ = sim.fk(q_cur)
             update_scene(sim, T_ee)
         if i % step_stride == 0 or i == len(pos) - 1:
-            frames.append(_annotate(sim.capture_screenshot(720, 540), title))
+            frames.append(_annotate(_capture_frame(sim, mode=camera_mode), title))
 
     for _ in range(10):
-        frames.append(_annotate(sim.capture_screenshot(720, 540), title))
+        frames.append(_annotate(_capture_frame(sim, mode=camera_mode), title))
 
 
 def build_book_insert_gif() -> Path:
@@ -162,13 +185,13 @@ def build_robomimic_gif(task_name: str) -> Path:
         grip_demo = float(np.clip(np.mean(demo.get("gripper_qpos", np.zeros((1, 2)))), 0.02, 0.08))
         _replay_segment(
             sim, demo["pos"], demo["quat"], f"{task_name}: demo", frames,
-            gripper_width=grip_demo, step_stride=1,
+            gripper_width=grip_demo, step_stride=1, camera_mode="robomimic",
         )
 
         _task_props(sim, task_name, demo)
         _replay_segment(
             sim, original[0], original[1], f"{task_name}: EMP original", frames,
-            gripper_width=0.04, step_stride=2,
+            gripper_width=0.04, step_stride=2, camera_mode="robomimic",
         )
 
         x0 = data["X"][0]
@@ -187,7 +210,7 @@ def build_robomimic_gif(task_name: str) -> Path:
             )
             _replay_segment(
                 sim, traj[0], traj[1], f"{task_name}: adapt {label}", frames,
-                gripper_width=0.04, step_stride=2,
+                gripper_width=0.04, step_stride=2, camera_mode="robomimic",
             )
 
     path = OUT_DIR / f"{task_name}_pybullet.gif"
