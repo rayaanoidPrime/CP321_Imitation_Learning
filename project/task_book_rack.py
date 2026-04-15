@@ -222,6 +222,35 @@ class BookInsertScene(SceneBase):
             physicsClientId=sim._pcid,
         )
 
+    def sync_to_sim(self, sim: PandaSimEnv, reset_book: bool = False) -> None:
+        """
+        Synchronize existing PyBullet bodies to the current scene geometry.
+
+        This is intended for interactive goal motion where we want to move the
+        rack body in-place without destroying and recreating the scene.
+        """
+        if self._rack_bid < 0:
+            self.spawn_in_sim(sim)
+            return
+
+        rack_pos, rack_q_wxyz = pose_to_quat(self.T_rack)
+        rack_xyzw = [rack_q_wxyz[1], rack_q_wxyz[2],
+                     rack_q_wxyz[3], rack_q_wxyz[0]]
+        pb.resetBasePositionAndOrientation(
+            self._rack_bid, rack_pos.tolist(), rack_xyzw,
+            physicsClientId=sim._pcid,
+        )
+
+        if reset_book and self._book_bid >= 0:
+            T_book_init = self.T_start @ self._T_ee_to_book
+            book_pos, book_q_wxyz = pose_to_quat(T_book_init)
+            book_xyzw = [book_q_wxyz[1], book_q_wxyz[2],
+                         book_q_wxyz[3], book_q_wxyz[0]]
+            pb.resetBasePositionAndOrientation(
+                self._book_bid, book_pos.tolist(), book_xyzw,
+                physicsClientId=sim._pcid,
+            )
+
     def set_variant(self,
                     rack_pos:   np.ndarray = None,
                     rack_euler: np.ndarray = None,
