@@ -488,6 +488,352 @@ def ori_velocity(q: np.ndarray, mu3d: np.ndarray, cov3d: np.ndarray,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 9b. Obstacle avoidance modulation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def modulate_velocity_obstacle(
+        x: np.ndarray,
+        xdot: np.ndarray,
+        obstacle_pos: np.ndarray,
+        obstacle_radius: float = 0.03,
+        influence_radius: float = 0.12,
+        gain: float = 0.5,
+) -> np.ndarray:
+    """
+    Modulate the nominal EMP velocity to avoid a spherical obstacle.
+
+    Uses the modulation approach from the EMP paper: when the EE enters the
+    influence radius of an obstacle, a repulsive component is added that
+    pushes the trajectory away from the obstacle surface while preserving
+    convergence to the goal.
+
+    Parameters
+    ----------
+    x                : current EE position (3,)
+    xdot             : nominal EMP velocity (3,)
+    obstacle_pos     : obstacle centre (3,)
+    obstacle_radius  : obstacle radius (m)
+    influence_radius : radius of influence zone around obstacle (m)
+    gain             : strength of repulsion
+
+    Returns
+    -------
+    modulated velocity (3,)
+    """
+    diff = x - obstacle_pos
+    dist = np.linalg.norm(diff)
+    safety_margin = obstacle_radius + 0.01  # extra margin
+
+    if dist > influence_radius or dist < 1e-9:
+        return xdot
+
+    # Normal direction from obstacle to EE
+    n = diff / dist
+
+    # How deep into the influence zone (0 = at boundary, 1 = at surface)
+    alpha = 1.0 - (dist - safety_margin) / (influence_radius - safety_margin)
+    alpha = np.clip(alpha, 0.0, 1.0)
+
+    # Project velocity onto tangent plane of obstacle surface
+    v_normal = np.dot(xdot, n) * n
+    v_tangent = xdot - v_normal
+
+    # If moving toward obstacle, add repulsion
+    if v_normal.dot(n) < 0:
+        repulsion = -gain * alpha * v_normal
+        xdot_mod = v_tangent + repulsion
+    else:
+        xdot_mod = xdot
+
+    # Scale to preserve nominal speed magnitude
+    nominal_speed = np.linalg.norm(xdot)
+    if nominal_speed > 1e-9:
+        mod_speed = np.linalg.norm(xdot_mod)
+        if mod_speed > 1e-9:
+            xdot_mod = xdot_mod * (nominal_speed / mod_speed)
+
+    return xdot_mod
+
+
+def rollout_se3_with_obstacles(
+        x0: np.ndarray,
+        q0: np.ndarray,
+        model: dict,
+        obstacle_pos: np.ndarray,
+        obstacle_radius: float = 0.03,
+        influence_radius: float = 0.12,
+        obstacle_gain: float = 0.5,
+        dt: float = None,
+        max_steps: int = 600,
+        pos_tol: float = 0.01,
+        ori_tol: float = 0.08,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    SE(3) EMP rollout with spherical obstacle avoidance modulation.
+
+    Parameters
+    ----------
+    x0, q0           : initial EE position (3,) and quaternion wxyz (4,)
+    model            : dict from train_emp or adapt_emp
+    obstacle_pos     : obstacle centre (3,)
+    obstacle_radius  : obstacle radius (m)
+    influence_radius : radius of influence zone (m)
+    obstacle_gain    : repulsion strength
+    dt, max_steps, pos_tol, ori_tol : same as rollout_se3
+
+    Returns
+    -------
+    pos_traj  : (T, 3)
+    quat_traj : (T, 4) wxyz
+    """
+    if dt is None:
+        dt = model['dt']
+
+    x = x0.copy()
+    q = q0.copy()
+    q /= np.linalg.norm(q)
+
+    pos_t  = [x.copy()]
+    quat_t = [q.copy()]
+
+    means_p  = model['means']
+    covs_p   = model['covs']
+    priors_p = model['priors']
+    Ak_pos   = model['Ak_pos']
+    x_star   = model['x_star']
+    mu3d     = model['mu3d']
+    cov3d    = model['cov3d']
+    priors_o = model['priors_o']
+    Ak_ori   = model['Ak_ori']
+    q_star   = model['q_star']
+
+    prev_err = np.linalg.norm(x - x_star)
+    stall_count = 0
+    for _ in range(max_steps):
+        xdot = pos_velocity(x, means_p, covs_p, priors_p, Ak_pos, x_star)
+
+        # Apply obstacle modulation
+        xdot = modulate_velocity_obstacle(
+            x, xdot, obstacle_pos, obstacle_radius,
+            influence_radius, obstacle_gain,
+        )
+
+        spd = np.linalg.norm(xdot)
+        if spd > 1e-9:
+            xdot = xdot * min(1.0, 0.25 / spd)
+        x = x + dt * xdot
+
+        omega = ori_velocity(q, mu3d, cov3d, priors_o, Ak_ori, q_star)
+        omg = np.linalg.norm(omega)
+        if omg > 1e-9:
+            omega = omega * min(1.0, 1.5 / omg)
+        dq    = quat_exp(dt * omega)
+        q     = quat_mul(dq, q)
+        q    /= np.linalg.norm(q)
+
+        pos_t.append(x.copy())
+        quat_t.append(q.copy())
+
+        pos_err = np.linalg.norm(x - x_star)
+        ori_err = np.linalg.norm(log_quat(q, q_star))
+        if pos_err < pos_tol and ori_err < ori_tol:
+            break
+        if prev_err - pos_err < 5e-5:
+            stall_count += 1
+        else:
+            stall_count = 0
+        prev_err = pos_err
+        if stall_count >= 40 and pos_err < 0.08:
+            break
+
+    pos_err = np.linalg.norm(pos_t[-1] - x_star)
+    ori_err = np.linalg.norm(log_quat(quat_t[-1], q_star))
+    if pos_err < 0.08 and (pos_err > pos_tol or ori_err > ori_tol):
+        x_cur = pos_t[-1].copy()
+        q_cur = quat_t[-1].copy()
+        for alpha in np.linspace(0.2, 1.0, 5):
+            x_blend = (1.0 - alpha) * x_cur + alpha * x_star
+            q_blend = exp_quat(alpha * log_quat(q_star, q_cur), q_cur)
+            pos_t.append(x_blend.copy())
+            quat_t.append(q_blend / np.linalg.norm(q_blend))
+
+    return np.array(pos_t), np.array(quat_t)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9b. Obstacle avoidance modulation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def modulate_velocity_obstacle(
+        x: np.ndarray,
+        xdot: np.ndarray,
+        obstacle_pos: np.ndarray,
+        obstacle_radius: float = 0.03,
+        influence_radius: float = 0.12,
+        gain: float = 0.5,
+) -> np.ndarray:
+    """
+    Modulate the nominal EMP velocity to avoid a spherical obstacle.
+
+    Uses the modulation approach from the EMP paper: when the EE enters the
+    influence radius of an obstacle, a repulsive component is added that
+    pushes the trajectory away from the obstacle surface while preserving
+    convergence to the goal.
+
+    Parameters
+    ----------
+    x                : current EE position (3,)
+    xdot             : nominal EMP velocity (3,)
+    obstacle_pos     : obstacle centre (3,)
+    obstacle_radius  : obstacle radius (m)
+    influence_radius : radius of influence zone around obstacle (m)
+    gain             : strength of repulsion
+
+    Returns
+    -------
+    modulated velocity (3,)
+    """
+    diff = x - obstacle_pos
+    dist = np.linalg.norm(diff)
+    safety_margin = obstacle_radius + 0.01  # extra margin
+
+    if dist > influence_radius or dist < 1e-9:
+        return xdot
+
+    # Normal direction from obstacle to EE
+    n = diff / dist
+
+    # How deep into the influence zone (0 = at boundary, 1 = at surface)
+    alpha = 1.0 - (dist - safety_margin) / (influence_radius - safety_margin)
+    alpha = np.clip(alpha, 0.0, 1.0)
+
+    # Project velocity onto tangent plane of obstacle surface
+    v_normal = np.dot(xdot, n) * n
+    v_tangent = xdot - v_normal
+
+    # If moving toward obstacle, add repulsion
+    if v_normal.dot(n) < 0:
+        repulsion = -gain * alpha * v_normal
+        xdot_mod = v_tangent + repulsion
+    else:
+        xdot_mod = xdot
+
+    # Scale to preserve nominal speed magnitude
+    nominal_speed = np.linalg.norm(xdot)
+    if nominal_speed > 1e-9:
+        mod_speed = np.linalg.norm(xdot_mod)
+        if mod_speed > 1e-9:
+            xdot_mod = xdot_mod * (nominal_speed / mod_speed)
+
+    return xdot_mod
+
+
+def rollout_se3_with_obstacles(
+        x0: np.ndarray,
+        q0: np.ndarray,
+        model: dict,
+        obstacle_pos: np.ndarray,
+        obstacle_radius: float = 0.03,
+        influence_radius: float = 0.12,
+        obstacle_gain: float = 0.5,
+        dt: float = None,
+        max_steps: int = 600,
+        pos_tol: float = 0.01,
+        ori_tol: float = 0.08,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    SE(3) EMP rollout with spherical obstacle avoidance modulation.
+
+    Parameters
+    ----------
+    x0, q0           : initial EE position (3,) and quaternion wxyz (4,)
+    model            : dict from train_emp or adapt_emp
+    obstacle_pos     : obstacle centre (3,)
+    obstacle_radius  : obstacle radius (m)
+    influence_radius : radius of influence zone (m)
+    obstacle_gain    : repulsion strength
+    dt, max_steps, pos_tol, ori_tol : same as rollout_se3
+
+    Returns
+    -------
+    pos_traj  : (T, 3)
+    quat_traj : (T, 4) wxyz
+    """
+    if dt is None:
+        dt = model['dt']
+
+    x = x0.copy()
+    q = q0.copy()
+    q /= np.linalg.norm(q)
+
+    pos_t  = [x.copy()]
+    quat_t = [q.copy()]
+
+    means_p  = model['means']
+    covs_p   = model['covs']
+    priors_p = model['priors']
+    Ak_pos   = model['Ak_pos']
+    x_star   = model['x_star']
+    mu3d     = model['mu3d']
+    cov3d    = model['cov3d']
+    priors_o = model['priors_o']
+    Ak_ori   = model['Ak_ori']
+    q_star   = model['q_star']
+
+    prev_err = np.linalg.norm(x - x_star)
+    stall_count = 0
+    for _ in range(max_steps):
+        xdot = pos_velocity(x, means_p, covs_p, priors_p, Ak_pos, x_star)
+
+        # Apply obstacle modulation
+        xdot = modulate_velocity_obstacle(
+            x, xdot, obstacle_pos, obstacle_radius,
+            influence_radius, obstacle_gain,
+        )
+
+        spd = np.linalg.norm(xdot)
+        if spd > 1e-9:
+            xdot = xdot * min(1.0, 0.25 / spd)
+        x = x + dt * xdot
+
+        omega = ori_velocity(q, mu3d, cov3d, priors_o, Ak_ori, q_star)
+        omg = np.linalg.norm(omega)
+        if omg > 1e-9:
+            omega = omega * min(1.0, 1.5 / omg)
+        dq    = quat_exp(dt * omega)
+        q     = quat_mul(dq, q)
+        q    /= np.linalg.norm(q)
+
+        pos_t.append(x.copy())
+        quat_t.append(q.copy())
+
+        pos_err = np.linalg.norm(x - x_star)
+        ori_err = np.linalg.norm(log_quat(q, q_star))
+        if pos_err < pos_tol and ori_err < ori_tol:
+            break
+        if prev_err - pos_err < 5e-5:
+            stall_count += 1
+        else:
+            stall_count = 0
+        prev_err = pos_err
+        if stall_count >= 40 and pos_err < 0.08:
+            break
+
+    pos_err = np.linalg.norm(pos_t[-1] - x_star)
+    ori_err = np.linalg.norm(log_quat(quat_t[-1], q_star))
+    if pos_err < 0.08 and (pos_err > pos_tol or ori_err > ori_tol):
+        x_cur = pos_t[-1].copy()
+        q_cur = quat_t[-1].copy()
+        for alpha in np.linspace(0.2, 1.0, 5):
+            x_blend = (1.0 - alpha) * x_cur + alpha * x_star
+            q_blend = exp_quat(alpha * log_quat(q_star, q_cur), q_cur)
+            pos_t.append(x_blend.copy())
+            quat_t.append(q_blend / np.linalg.norm(q_blend))
+
+    return np.array(pos_t), np.array(quat_t)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 10.  SE(3) rollout
 # ══════════════════════════════════════════════════════════════════════════════
 

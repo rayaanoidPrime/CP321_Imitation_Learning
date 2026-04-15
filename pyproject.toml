@@ -8,3 +8,8 @@ dependencies = [
     "scipy",
     "pybullet"
 ]
+
+[tool.uv.workspace]
+members = [
+    "project",
+]
